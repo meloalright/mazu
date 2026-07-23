@@ -1,31 +1,34 @@
-app = "mazu"
-primary_region = "nrt"
+# fly.toml app configuration file generated for mazu on 2026-07-23T05:54:10Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'mazu'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  MAZU_DATA_DIR = "/data"
+  MAZU_DATA_DIR = '/data'
+  PORT = '8080'
 
-# 号码要连续，所以只跑一台，且不允许自动扩到多实例
+[[mounts]]
+  source = 'mazu_data'
+  destination = '/data'
+
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
-[[http_service.checks]]
-  path = "/healthz"
-  interval = "30s"
-  timeout = "5s"
-
-# 香火簿要持久化，否则机器一停号码就归零
-[[mounts]]
-  source = "mazu_data"
-  destination = "/data"
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    path = '/healthz'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'
