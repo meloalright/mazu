@@ -1,0 +1,15 @@
+[package]
+name = "mazu"
+version = "0.1.0"
+edition = "2021"
+description = "curl mazu.sh — 赛博祭拜妈祖"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

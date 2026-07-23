@@ -1,0 +1,31 @@
+app = "mazu"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  MAZU_DATA_DIR = "/data"
+
+# 号码要连续，所以只跑一台，且不允许自动扩到多实例
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[http_service.checks]]
+  path = "/healthz"
+  interval = "30s"
+  timeout = "5s"
+
+# 香火簿要持久化，否则机器一停号码就归零
+[[mounts]]
+  source = "mazu_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
