@@ -1,10 +1,7 @@
 FROM rust:1.95-slim-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY skill ./skill
 RUN cargo build --release
 
 FROM debian:bookworm-slim

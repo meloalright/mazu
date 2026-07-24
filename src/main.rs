@@ -1,26 +1,41 @@
 //! mazu.sh 一肩挑：
-//!   ssh mazu.sh       → 祭拜（认公钥指纹，本地计数）
-//!   curl mazu.sh      → 介绍页
-//!   curl mazu.sh/skill→ SKILL.md
-//! 香火簿是本地文件，跑在 Fly 单实例上，挂 volume 持久化。
+//!   ssh mazu.sh   → 可走动的媽祖廟，同时在里面的人彼此看得见
+//!   curl mazu.sh  → 一句提示，指向 ssh
+//! 香火簿与头像都是本地文件，跑在 Fly 单实例上，挂 volume 持久化。
 
+mod avatars;
 mod counter;
 mod sha256;
 mod site;
+mod space;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use avatars::Avatars;
 use counter::Counter;
+use space::{Action, Choosing, World};
 use russh::keys::{HashAlg, PrivateKey};
-use russh::server::{Auth, Handler, Msg, Server as _, Session};
+use russh::server::{Auth, Handler, Msg, Session};
 use russh::MethodKind;
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 沒帶公鑰時媽祖回的話：香火認人靠公鑰指紋，無鑰不記名，教他鑄一把再來
+const NO_KEY: &str = "\
+媽祖曰：無鑰之人，媽祖認你不得，香火不敢記名 🙏\r\n\
+\r\n\
+且先鑄一把金鑰：\r\n\
+\r\n\
+    ssh-keygen -t ed25519\r\n\
+\r\n\
+一路 Enter 即可。鑄畢再來，ssh mazu.sh 便能上香。";
+
+/// 离廟时清屏、恢复光标
+const LEAVE: &str = "\x1b[2J\x1b[H\x1b[?25h媽祖保佑，慢走 🙏\r\n";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,29 +47,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let salt = std::env::var("MAZU_SALT").unwrap_or_else(|_| "mazu".into());
 
     let counter = Arc::new(Mutex::new(Counter::open(&data_dir, salt)?));
+    let avatars = {
+        let mut a = Avatars::open(&data_dir)?;
+        a.compact_if_needed();
+        Arc::new(Mutex::new(a))
+    };
 
     let config = Arc::new(russh::server::Config {
         inactivity_timeout: Some(TIMEOUT),
         auth_rejection_time: std::time::Duration::from_secs(1),
+        // ssh 客户端总是先发一次 none 探测可用认证方式，我们必然拒绝它。
+        // 不置零的话每个连接都要白等 auth_rejection_time，实测每次祭拜 1.04 秒。
+        auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         keys: vec![load_or_create_host_key(&host_key_path)?],
         ..Default::default()
     });
 
+    let world = Arc::new(Mutex::new(World::default()));
+    let (tick, _) = tokio::sync::broadcast::channel::<()>(64);
+    let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
     let temple = Temple {
         counter: Arc::clone(&counter),
+        avatars: Arc::clone(&avatars),
         fingerprint: None,
+        has_pty: false,
+        world: Arc::clone(&world),
+        tick: tick.clone(),
+        id: 0,
+        choosing: None,
     };
 
     let mut tasks = Vec::new();
 
+    // 同时在处理的 SSH 会话上限。满了就直接断开新连接：
+    // 与其所有人一起排队到超时，不如少数被快速拒绝、其余正常上香。
+    let max_sessions: usize = std::env::var("MAZU_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let gate = Arc::new(tokio::sync::Semaphore::new(max_sessions));
+    println!("[mazu] ssh  并发上限 {max_sessions}");
+
     for port in ssh_ports {
         let socket = TcpListener::bind(("0.0.0.0", port)).await?;
         let config = Arc::clone(&config);
-        let mut temple = temple.clone();
+        let temple = temple.clone();
+        let gate = Arc::clone(&gate);
+        let next_id = Arc::clone(&next_id);
+        let world = Arc::clone(&world);
+        let tick = tick.clone();
         println!("[mazu] ssh  门开在 {port}");
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = temple.run_on_socket(config, &socket).await {
-                eprintln!("[mazu] ssh {port} 挂了: {e}");
+            loop {
+                let Ok((stream, _)) = socket.accept().await else {
+                    continue;
+                };
+                // try_acquire 不排队：满了立刻放弃这个连接
+                let Ok(permit) = Arc::clone(&gate).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let config = Arc::clone(&config);
+                let mut temple = temple.clone();
+                temple.id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let id = temple.id;
+                let world = Arc::clone(&world);
+                let tick = tick.clone();
+                tokio::spawn(async move {
+                    let _permit = permit; // 会话结束才归还名额
+                    match russh::server::run_stream(config, stream, temple).await {
+                        Ok(session) => {
+                            let _ = session.await;
+                        }
+                        Err(e) => eprintln!("[mazu] 会话建立失败: {e}"),
+                    }
+                    // 断线也要把人从廟里移走，否则会留下幽灵
+                    world.lock().unwrap_or_else(|e| e.into_inner()).leave(id);
+                    let _ = tick.send(());
+                });
             }
         }));
     }
@@ -86,9 +157,10 @@ async fn serve_http(socket: TcpListener) {
             continue;
         };
         tokio::spawn(async move {
+            // 加超时：只连不发的客户端否则会把 task 和 socket 永久占住
             let mut buf = vec![0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
+            let n = match tokio::time::timeout(TIMEOUT, stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => n,
                 _ => return,
             };
             let req = String::from_utf8_lossy(&buf[..n]);
@@ -158,20 +230,36 @@ fn load_or_create_host_key(path: &PathBuf) -> Result<PrivateKey, Box<dyn std::er
     Ok(key)
 }
 
-#[derive(Clone)]
 struct Temple {
     counter: Arc<Mutex<Counter>>,
+    avatars: Arc<Mutex<Avatars>>,
     /// 本次连接用的公钥指纹，认证时记下
     fingerprint: Option<String>,
+    /// 客户端有没有申请 PTY。没有就说明是脚本或 agent，走一次性祭拜。
+    has_pty: bool,
+    /// 廟里所有人共享一份，谁动了都要给所有人重画
+    world: Arc<Mutex<World>>,
+    /// 有人变动就往这里喊一声，各会话的推帧任务据此重绘
+    tick: tokio::sync::broadcast::Sender<()>,
+    /// 本次会话在世界里的编号
+    id: space::Id,
+    /// 还没进世界时的选头像状态。会话私有，所以不参与 Clone。
+    choosing: Option<Choosing>,
 }
 
-impl russh::server::Server for Temple {
-    type Handler = Self;
-    fn new_client(&mut self, _peer: Option<SocketAddr>) -> Self {
-        self.clone()
-    }
-    fn handle_session_error(&mut self, error: russh::Error) {
-        eprintln!("[mazu] 会话出错: {error}");
+/// 克隆出来的是一份全新会话：共享的东西继续共享，身份与状态一律归零
+impl Clone for Temple {
+    fn clone(&self) -> Self {
+        Self {
+            counter: Arc::clone(&self.counter),
+            avatars: Arc::clone(&self.avatars),
+            fingerprint: None,
+            has_pty: false,
+            world: Arc::clone(&self.world),
+            tick: self.tick.clone(),
+            id: 0,
+            choosing: None,
+        }
     }
 }
 
@@ -198,8 +286,8 @@ impl Handler for Temple {
         Ok(Auth::Accept)
     }
 
-    /// ssh 客户端总是先试 none。这里必须拒掉并要求 publickey，
-    /// 否则认证在客户端出示公钥之前就成功了，所有人都会变成同一个 anonymous。
+    /// ssh 客户端总是先试 none。这里拒掉并要求 publickey；
+    /// 沒公鑰的退到 keyboard-interactive 也放進來，但進來後只勸他去鑄鑰、不記香火。
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         Ok(Auth::Reject {
             proceed_with_methods: Some(
@@ -211,7 +299,7 @@ impl Handler for Temple {
         })
     }
 
-    /// 没有公钥的信众走这条路，不问任何问题直接放行，身份记为 anonymous
+    /// 沒有公鑰的信眾走這條路，放行但不認人（fingerprint 保持 None）
     async fn auth_keyboard_interactive<'a>(
         &'a mut self,
         _user: &str,
@@ -232,18 +320,26 @@ impl Handler for Temple {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.has_pty = true;
         session.channel_success(channel)?;
         Ok(())
     }
 
+    /// 有 PTY 就进交互空间；没有（脚本、agent）就一次性祭拜后关门
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.bless(channel, session)
+        session.channel_success(channel)?;
+        if self.has_pty && self.fingerprint.is_some() {
+            self.enter_space(channel, session)
+        } else {
+            self.bless(channel, session)
+        }
     }
 
+    /// `ssh mazu.sh <命令>` 一律走一次性祭拜，不进空间
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -252,25 +348,175 @@ impl Handler for Temple {
     ) -> Result<(), Self::Error> {
         self.bless(channel, session)
     }
+
+    /// 交互空间的按键都从这里进来
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        for key in space::parse_keys(data) {
+            // 还在选头像：选定后才落地进世界
+            if let Some(c) = self.choosing.as_mut() {
+                match c.handle(key) {
+                    Some(picked) => {
+                        if let Some(fp) = self.fingerprint.clone() {
+                            self.avatars
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .set(&fp, picked);
+                        }
+                        self.choosing = None;
+                        self.join_world(picked);
+                        self.push(channel, session)?;
+                    }
+                    None => {
+                        let frame = c.render();
+                        session.data(channel, frame.into_bytes())?;
+                    }
+                }
+                continue;
+            }
+
+            let action = self
+                .world
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle(self.id, key);
+            match action {
+                Action::Idle => {}
+                Action::Redraw => self.push(channel, session)?,
+                Action::Worship => {
+                    let line = self.record_worship();
+                    self.world
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_blessing(self.id, line);
+                    self.push(channel, session)?;
+                }
+                Action::Leave => {
+                    self.world
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .leave(self.id);
+                    let _ = self.tick.send(());
+                    session.data(channel, LEAVE.as_bytes().to_vec())?;
+                    session.exit_status_request(channel, 0)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Temple {
+    /// 进廟：首次来的公钥先选头像，认识的直接落进廟里
+    fn enter_space(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let known = self.fingerprint.as_ref().and_then(|fp| {
+            self.avatars
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(fp)
+        });
+
+        // 别人走动时也要给我重画，所以开一个推帧任务盯着世界变化
+        self.watch(channel, session);
+
+        match known {
+            Some(avatar) => {
+                self.join_world(avatar);
+                self.push(channel, session)
+            }
+            None => {
+                let c = Choosing::new();
+                session.data(channel, c.render().into_bytes())?;
+                self.choosing = Some(c);
+                Ok(())
+            }
+        }
+    }
+
+    fn join_world(&mut self, avatar: usize) {
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join(self.id, avatar);
+        let _ = self.tick.send(());
+    }
+
+    /// 自己动了：先画给自己，再喊一声让别人也重画
+    fn push(&self, channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
+        let frame = self
+            .world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .render(self.id);
+        session.data(channel, frame.into_bytes())?;
+        let _ = self.tick.send(());
+        Ok(())
+    }
+
+    /// 盯着世界变化，别人动了就把新画面推给我
+    fn watch(&self, channel: ChannelId, session: &mut Session) {
+        let handle = session.handle();
+        let world = Arc::clone(&self.world);
+        let mut rx = self.tick.subscribe();
+        let id = self.id;
+        tokio::spawn(async move {
+            while rx.recv().await.is_ok() {
+                let frame = {
+                    let w = world.lock().unwrap_or_else(|e| e.into_inner());
+                    // 自己已经离廟就不必再推了
+                    if !w.is_in(id) {
+                        break;
+                    }
+                    w.render(id)
+                };
+                if handle.data(channel, frame.into_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// 记一次香火，返回那句话
+    fn record_worship(&mut self) -> String {
+        let Some(fp) = self.fingerprint.clone() else {
+            return String::new();
+        };
+        let mut c = self.counter.lock().unwrap_or_else(|e| e.into_inner());
+        let w = c.worship(&fp);
+        if w.visits > 1 {
+            format!("你今天第 {} 次祭拜媽祖 · 今天共 {} 位信眾 🙏", w.visits, w.total)
+        } else {
+            format!("你是今天第 {} 位祭拜媽祖 🙏", w.rank)
+        }
+    }
+
     /// 上一炷香：本地记一笔，把那句话写回去然后关门
     fn bless(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
         session.channel_success(channel)?;
 
-        let identity = self
-            .fingerprint
-            .clone()
-            .unwrap_or_else(|| "anonymous".to_string());
-        let line = {
-            let mut c = self.counter.lock().unwrap_or_else(|e| e.into_inner());
-            let w = c.worship(&identity);
-            if w.visits > 1 {
-                format!("你今天第 {} 次祭拜媽祖，今天共 {} 位信眾 🙏", w.visits, w.total)
-            } else {
-                format!("你是今天第 {} 位祭拜媽祖 🙏", w.rank)
+        // 有公鑰才認人記香火；沒公鑰的不記名，只勸他去鑄一把金鑰再來
+        let line = match &self.fingerprint {
+            Some(fp) => {
+                let mut c = self.counter.lock().unwrap_or_else(|e| e.into_inner());
+                let w = c.worship(fp);
+                if w.visits > 1 {
+                    format!("你今天第 {} 次祭拜媽祖 · 今天共 {} 位信眾 🙏", w.visits, w.total)
+                } else {
+                    format!("你是今天第 {} 位祭拜媽祖 🙏", w.rank)
+                }
             }
+            None => NO_KEY.to_string(),
         };
 
         session.data(channel, format!("{line}\r\n").into_bytes())?;

@@ -11,7 +11,6 @@ const TZ_OFFSET_SECS: i64 = 8 * 3600;
 const KEEP_DAYS: usize = 30;
 
 pub struct Worship {
-    pub day: String,
     /// 当天第几位祭拜的人，认下不改
     pub rank: u64,
     /// 这个人今天拜了第几次
@@ -97,7 +96,6 @@ impl Counter {
         }
 
         Worship {
-            day,
             rank: pilgrim.rank,
             visits: pilgrim.visits,
             total,
@@ -166,7 +164,7 @@ fn load(path: &Path) -> std::io::Result<(HashMap<String, DayRecord>, usize)> {
     Ok((days, lines))
 }
 
-pub fn today() -> String {
+fn today() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
